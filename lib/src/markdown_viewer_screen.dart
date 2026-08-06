@@ -4,14 +4,17 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:flutter_svg/flutter_svg.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:re_editor/re_editor.dart';
 import 'package:screen_retriever/screen_retriever.dart';
 
 import 'editor_theme.dart';
+import 'log_service.dart';
 import 'mermaid_view.dart';
+import 'pdf_export.dart';
 import 'package:window_manager/window_manager.dart';
+import 'ui_kit.dart';
+import 'workspace_store.dart';
 
 // ─── 主内容组件 ─────────────────────────────────────────────────────────────
 
@@ -34,6 +37,13 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   Rect _restoreBounds = const Rect.fromLTWH(0, 0, 1400, 1000);
   String? _currentFilePath;
 
+  // 左侧工作区
+  final _store = WorkspaceStore();
+  List<String> _projectFiles = []; // files/ 目录下的文件名
+  List<String> _historyPaths = []; // 历史文件路径
+  double _workspaceWidth = 240;
+  bool _isWorkspaceDragging = false;
+
   // 编辑器设置（可在设置弹窗中调整）
   double _editorFontSize = 14;
   double _editorLineHeight = 1.8;
@@ -42,6 +52,11 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   // 保存状态：记录最后一次保存时的文本，用于 dirty 判断
   String _savedBaseline = '';
 
+  // 导出 PDF 进行中：控制导出按钮显示转圈并禁用
+  bool _isExporting = false;
+  // 导出图表 PNG 进行中：控制导出按钮显示转圈并禁用
+  bool _isExportingPng = false;
+
   @override
   void initState() {
     super.initState();
@@ -49,6 +64,34 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     _controller.addListener(_onEditorChanged);
     // 直接监听全局键盘，确保 Ctrl+S 在编辑器聚焦时也能触发保存
     HardwareKeyboard.instance.addHandler(_onHardwareKey);
+    _loadWorkspace();
+  }
+
+  /// 启动时加载左侧工作区：确保目录存在，列出项目文件与历史记录。
+  Future<void> _loadWorkspace() async {
+    try {
+      await _store.ensureReady();
+      final projectFiles = await _store.listProjectFiles();
+      final historyPaths = await _store.loadHistory();
+      if (!mounted) return;
+      setState(() {
+        _projectFiles = projectFiles.map((f) => f.path).toList();
+        _historyPaths = historyPaths;
+      });
+    } catch (e) {
+      LogService.error('加载工作区失败', exception: e);
+    }
+  }
+
+  /// 刷新左侧工作区（项目文件 + 历史）。
+  Future<void> _refreshWorkspace() async {
+    final projectFiles = await _store.listProjectFiles();
+    final historyPaths = await _store.loadHistory();
+    if (!mounted) return;
+    setState(() {
+      _projectFiles = projectFiles.map((f) => f.path).toList();
+      _historyPaths = historyPaths;
+    });
   }
 
   @override
@@ -203,7 +246,138 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
 
   // ── 文件操作 ───────────────────────────────────────────────────────────
 
+  /// 创建文件：弹窗输入文件名，在项目 files/ 目录创建并打开编辑。
+  Future<void> _newFile() async {
+    if (!await _confirmDiscardIfDirty()) return;
+    if (!mounted) return;
+
+    final input = await _promptFileName();
+    if (input == null || !mounted) return;
+
+    // 规范化文件名
+    var name = input.trim();
+    if (name.isEmpty) {
+      _showSnackBar('文件名不能为空', error: true);
+      return;
+    }
+    // Windows 路径非法字符校验
+    if (RegExp(r'[\\/:*?"<>|]').hasMatch(name)) {
+      _showSnackBar('文件名包含非法字符', error: true);
+      return;
+    }
+    // 未带支持扩展名时自动补 .md
+    final dot = name.lastIndexOf('.');
+    final hasSupportedExt = dot > 0 &&
+        WorkspaceStore.supportedExtensions
+            .contains(name.substring(dot + 1).toLowerCase());
+    if (!hasSupportedExt) name = '$name.md';
+
+    final path = '${_store.filesDir}${Platform.pathSeparator}$name';
+    final file = File(path);
+    if (await file.exists()) {
+      _showSnackBar('文件已存在: $name', error: true);
+      return;
+    }
+
+    try {
+      await file.writeAsString('');
+      final ok = await _loadFile(path);
+      await _refreshWorkspace();
+      if (ok && mounted) {
+        _showSnackBar('已创建: $name');
+      }
+    } catch (e) {
+      if (mounted) {
+        _showSnackBar('创建文件失败: $e', error: true);
+      }
+    }
+  }
+
+  /// 弹窗输入新建文件名；返回 null 表示取消。
+  ///
+  /// 输入框封装为 [_FileNameField]（内部持有并释放 TextEditingController），
+  /// 避免对话框退场动画期间 controller 被提前 dispose 导致崩溃。
+  Future<String?> _promptFileName() async {
+    var value = '';
+    return showModernDialog<String>(
+      context,
+      ModernDialogFrame(
+        icon: Icons.note_add_rounded,
+        title: '创建文件',
+        subtitle: '将保存到项目 files/ 目录',
+        width: 360,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          GradientButton(
+            label: '创建',
+            icon: Icons.check_rounded,
+            onPressed: () => Navigator.of(context).pop(value),
+          ),
+        ],
+        children: [
+          _FileNameField(
+            onChanged: (v) => value = v,
+            onSubmitted: (v) => Navigator.of(context).pop(v),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 载入指定路径的文件到编辑器；成功返回 true。
+  /// 历史区 / 项目区点击共用此入口。
+  Future<bool> _loadFile(String path) async {
+    try {
+      final content = await File(path).readAsString();
+      _controller.text = content;
+      _currentFilePath = path;
+      _savedBaseline = content;
+      if (mounted) setState(() {});
+      return true;
+    } catch (e) {
+      if (mounted) {
+        _showSnackBar('读取文件失败: $e', error: true);
+      }
+      return false;
+    }
+  }
+
+  /// 有未保存修改时弹出确认；用户选择"放弃修改"返回 true。
+  Future<bool> _confirmDiscardIfDirty() async {
+    if (!_isDirty) return true;
+    if (!mounted) return false;
+    final result = await showModernDialog<bool>(
+      context,
+      ModernDialogFrame(
+        icon: Icons.warning_amber_rounded,
+        title: '未保存的修改',
+        subtitle: '切换将丢失未保存内容',
+        width: 380,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          GradientButton(
+            label: '放弃修改',
+            icon: Icons.delete_sweep_rounded,
+            onPressed: () => Navigator.of(context).pop(true),
+          ),
+        ],
+        children: const [
+          Text('当前文件有未保存的修改，继续操作将丢失这些修改。',
+              style: TextStyle(fontSize: 13.5, height: 1.6, color: kTextPrimary)),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
   Future<void> _openFile() async {
+    if (!await _confirmDiscardIfDirty()) return;
     final result = await FilePicker.platform.pickFiles(
       type: FileType.custom,
       allowedExtensions: ['md', 'markdown', 'txt'],
@@ -213,26 +387,24 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     final filePath = result.files.first.path;
     if (filePath == null) return;
 
-    try {
-      final content = await File(filePath).readAsString();
-      _controller.text = content;
-      _currentFilePath = filePath;
-      _savedBaseline = content;
-      if (mounted) {
-        _showSnackBar('已加载: ${result.files.first.name}');
-      }
-    } catch (e) {
-      if (mounted) {
-        _showSnackBar('读取文件失败: $e', error: true);
+    final ok = await _loadFile(filePath);
+    if (ok && mounted) {
+      _showSnackBar('已加载: ${result.files.first.name}');
+      // files/ 之外打开的文件记录到历史
+      if (!_store.isInsideFilesDir(filePath)) {
+        await _store.addHistory(filePath);
+        await _refreshWorkspace();
       }
     }
   }
 
   Future<void> _saveFile() async {
     String? savePath = _currentFilePath;
+    // 未命名（新建）文件：默认保存到工作区 files/ 目录
     savePath ??= await FilePicker.platform.saveFile(
       dialogTitle: '保存 Markdown 文件',
-      fileName: 'output.md',
+      fileName: '新建文档.md',
+      initialDirectory: _store.filesDir,
       type: FileType.custom,
       allowedExtensions: ['md', 'markdown', 'txt'],
     );
@@ -240,18 +412,144 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
 
     try {
       await File(savePath).writeAsString(_controller.text);
-      _currentFilePath = savePath;
-      _savedBaseline = _controller.text;
-      if (mounted) setState(() {});
+      setState(() {
+        _currentFilePath = savePath;
+        _savedBaseline = _controller.text;
+      });
       if (mounted) {
         final name = savePath.split(Platform.pathSeparator).last;
         _showSnackBar('已保存: $name');
+      }
+      // 保存到 files/ 内的文件，刷新项目文件列表
+      if (_store.isInsideFilesDir(savePath)) {
+        await _refreshWorkspace();
       }
     } catch (e) {
       if (mounted) {
         _showSnackBar('保存失败: $e', error: true);
       }
     }
+  }
+
+  /// 重新从磁盘读取当前文件，丢弃内存中的编辑内容。
+  Future<void> _reloadFile() async {
+    final path = _currentFilePath;
+    if (path == null) {
+      _showSnackBar('当前没有打开的文件', error: true);
+      return;
+    }
+    if (!await _confirmDiscardIfDirty()) return;
+    if (!await File(path).exists()) {
+      _showSnackBar('文件已不存在', error: true);
+      return;
+    }
+    final ok = await _loadFile(path);
+    if (ok && mounted) {
+      _showSnackBar('已重新加载');
+    }
+  }
+
+  /// 将预览内容导出为 PDF（Edge 无头渲染，含 Mermaid 图表）。
+  ///
+  /// 导出期间显示加载状态：导出按钮转圈并禁用。
+  Future<void> _exportPdf() async {
+    if (_rawMarkdown.trim().isEmpty) {
+      _showSnackBar('没有可导出的内容', error: true);
+      return;
+    }
+    final outputPath = await FilePicker.platform.saveFile(
+      dialogTitle: '导出 PDF',
+      fileName: '文档.pdf',
+      type: FileType.custom,
+      allowedExtensions: ['pdf'],
+    );
+    if (outputPath == null) return;
+
+    // 默认补 .pdf 后缀：用户输入的文件名未带扩展名时自动加上
+    var path = outputPath;
+    if (!path.toLowerCase().endsWith('.pdf')) {
+      path = '$path.pdf';
+    }
+
+    if (mounted) setState(() => _isExporting = true);
+    try {
+      final (ok, message) = await exportToPdf(_rawMarkdown, path);
+      if (!mounted) return;
+      if (ok) {
+        _showSnackBar(message);
+      } else {
+        _showExportError(message);
+      }
+    } finally {
+      if (mounted) setState(() => _isExporting = false);
+    }
+  }
+
+  /// 将所有 Mermaid 图表导出为 PNG：选择目录后自动创建「文件名+图表」文件夹，
+  /// 导出期间按钮显示转圈并禁用。
+  Future<void> _exportChartsPng() async {
+    if (_mermaidBlocks == 0) {
+      _showSnackBar('没有 Mermaid 图表', error: true);
+      return;
+    }
+    final dir = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: '选择图表导出目录',
+    );
+    if (dir == null || !mounted) return;
+
+    final target = '$dir${Platform.pathSeparator}$_fileNameStem图表';
+    if (mounted) setState(() => _isExportingPng = true);
+    try {
+      final (ok, message) = await exportChartsToPng(_rawMarkdown, target);
+      if (!mounted) return;
+      if (ok) {
+        _showSnackBar(message);
+      } else {
+        _showExportError(message);
+      }
+    } finally {
+      if (mounted) setState(() => _isExportingPng = false);
+    }
+  }
+
+  /// 当前文件名去掉扩展名；未命名文件返回「未命名」。
+  String get _fileNameStem {
+    if (_currentFilePath == null) return '未命名';
+    final base = _currentFilePath!.split(Platform.pathSeparator).last;
+    final dot = base.lastIndexOf('.');
+    return dot > 0 ? base.substring(0, dot) : base;
+  }
+
+  /// 导出失败时用弹窗展示完整错误（可选中复制），避免 SnackBar 一闪而过。
+  void _showExportError(String message) {
+    if (!mounted) return;
+    showModernDialog<void>(
+      context,
+      ModernDialogFrame(
+        icon: Icons.error_outline_rounded,
+        title: '导出失败',
+        subtitle: '以下是详细信息，可选中复制',
+        width: 440,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
+        children: [
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxHeight: 300),
+            child: SingleChildScrollView(
+              child: SelectableText(
+                message,
+                style: const TextStyle(
+                    fontSize: 13, height: 1.6, color: kTextPrimary),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showSnackBar(String message, {bool error = false}) {
@@ -306,9 +604,24 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
         body: Column(
           children: [
             _buildTitleBar(),
-            _buildToolbar(),
-            _buildFormatBar(),
-            Expanded(child: _buildSplitView()),
+            Expanded(
+              child: Row(
+                children: [
+                  // 左侧工作区：项目文件 + 历史
+                  _buildWorkspace(),
+                  _buildWorkspaceDivider(),
+                  Expanded(
+                    child: Column(
+                      children: [
+                        _buildToolbar(),
+                        _buildFormatBar(),
+                        Expanded(child: _buildSplitView()),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
             _buildStatusBar(),
           ],
         ),
@@ -325,20 +638,21 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
         height: 36,
         padding: const EdgeInsets.symmetric(horizontal: 8),
         decoration: const BoxDecoration(
-          color: kPreviewBg,
+          gradient: LinearGradient(
+            colors: [Color(0xFFFFFFFF), Color(0xFFF2F5FF)],
+          ),
           border: Border(bottom: BorderSide(color: kBorder, width: 0.5)),
         ),
         child: Row(
           children: [
-            const SizedBox(width: 4),
-            SvgPicture.asset('assets/markdown.svg',
-                width: 18, height: 18),
-            const SizedBox(width: 8),
+            const SizedBox(width: 6),
+            const BrandIcon(icon: Icons.code_rounded, size: 24, iconSize: 15),
+            const SizedBox(width: 10),
             const Text('OrbbyMDEditor',
                 style: TextStyle(
                     color: kTextPrimary,
                     fontSize: 13,
-                    fontWeight: FontWeight.w500,
+                    fontWeight: FontWeight.w600,
                     decoration: TextDecoration.none)),
             const Spacer(),
             _TitleBarBtn(
@@ -352,8 +666,240 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
                 onTap: _toggleMaximize),
             const SizedBox(width: 4),
             _TitleBarBtn(
-                icon: Icons.close_rounded, onTap: () => windowManager.destroy()),
+                icon: Icons.close_rounded,
+                onTap: () => windowManager.destroy(),
+                danger: true),
           ],
+        ),
+      ),
+    );
+  }
+
+  // ── 左侧工作区 ───────────────────────────────────────────────────────────
+
+  /// 左侧面板：上半项目文件区，下半历史区。
+  Widget _buildWorkspace() {
+    return Container(
+      width: _workspaceWidth,
+      color: kEditorPanelBg,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Expanded(
+            flex: 3,
+            child: _buildFileListPanel(
+              title: '项目文件',
+              icon: Icons.folder_rounded,
+              onAction: _refreshWorkspace,
+              actionIcon: Icons.refresh_rounded,
+              actionTooltip: '刷新',
+              emptyText: '暂无文件',
+              above: _buildCreateFileButton(),
+              children: _projectFiles
+                  .map((p) => _buildProjectFileItem(p))
+                  .toList(),
+            ),
+          ),
+          // 上下分区线
+          Container(height: 1, color: kBorder),
+          Expanded(
+            flex: 2,
+            child: _buildFileListPanel(
+              title: '历史',
+              icon: Icons.history_rounded,
+              onAction: _clearHistory,
+              actionIcon: Icons.delete_sweep_rounded,
+              actionTooltip: '清空历史',
+              emptyText: '暂无历史',
+              children:
+                  _historyPaths.map((p) => _buildHistoryItem(p)).toList(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 项目文件列表项：点击在编辑区打开。
+  Widget _buildProjectFileItem(String path) {
+    final name = path.split(Platform.pathSeparator).last;
+    return _WorkspaceListItem(
+      label: name,
+      sublabel: path,
+      active: _currentFilePath == path,
+      onTap: () => _onProjectFileTap(path),
+    );
+  }
+
+  Future<void> _onProjectFileTap(String path) async {
+    if (!await _confirmDiscardIfDirty()) return;
+    final ok = await _loadFile(path);
+    if (ok && mounted) {
+      _showSnackBar('已加载: ${path.split(Platform.pathSeparator).last}');
+    }
+  }
+
+  /// 历史列表项：点击重新打开；文件不存在时提示移除。
+  Widget _buildHistoryItem(String path) {
+    final name = path.split(Platform.pathSeparator).last;
+    return _WorkspaceListItem(
+      label: name,
+      sublabel: path,
+      active: _currentFilePath == path,
+      onTap: () => _onHistoryTap(path),
+    );
+  }
+
+  Future<void> _onHistoryTap(String path) async {
+    if (!await _confirmDiscardIfDirty()) return;
+    if (!await File(path).exists()) {
+      final name = path.split(Platform.pathSeparator).last;
+      final remove = await _confirmRemoveHistory(name, path);
+      if (remove == true) {
+        await _store.removeHistory(path);
+        await _refreshWorkspace();
+      }
+      return;
+    }
+    final ok = await _loadFile(path);
+    if (ok && mounted) {
+      _showSnackBar('已加载: ${path.split(Platform.pathSeparator).last}');
+    }
+  }
+
+  Future<bool> _confirmRemoveHistory(String name, String path) async {
+    if (!mounted) return false;
+    final result = await showModernDialog<bool>(
+      context,
+      ModernDialogFrame(
+        icon: Icons.link_off_rounded,
+        title: '文件不存在',
+        subtitle: '历史记录指向的文件已失效',
+        width: 380,
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('保留'),
+          ),
+          GradientButton(
+            label: '移除',
+            icon: Icons.delete_forever_rounded,
+            onPressed: () => Navigator.of(context).pop(true),
+          ),
+        ],
+        children: [
+          Text('「$name」已不存在或已被移动，是否从历史中移除？',
+              style: const TextStyle(
+                  fontSize: 13.5, height: 1.6, color: kTextPrimary)),
+          const SizedBox(height: 8),
+          Text(path,
+              style: const TextStyle(fontSize: 12, color: kTextSecondary)),
+        ],
+      ),
+    );
+    return result ?? false;
+  }
+
+  Future<void> _clearHistory() async {
+    await _store.clearHistory();
+    await _refreshWorkspace();
+  }
+
+  /// 通用文件列表面板：标题行（含操作按钮）+ 可选的列表上方全宽区域 + 列表。
+  Widget _buildFileListPanel({
+    required String title,
+    required IconData icon,
+    required VoidCallback? onAction,
+    required IconData actionIcon,
+    required String actionTooltip,
+    required String emptyText,
+    Widget? above,
+    required List<Widget> children,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // 面板标题行
+        Container(
+          height: 32,
+          padding: const EdgeInsets.only(left: 10, right: 4),
+          decoration: const BoxDecoration(
+            color: kEditorPanelBg,
+            border: Border(bottom: BorderSide(color: kBorder, width: 0.5)),
+          ),
+          child: Row(
+            children: [
+              BrandIcon(icon: icon, size: 20, iconSize: 12),
+              const SizedBox(width: 8),
+              Text(title,
+                  style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: kTextPrimary)),
+              const Spacer(),
+              if (onAction != null)
+                _MiniBtn(
+                    icon: actionIcon, tooltip: actionTooltip, onTap: onAction),
+            ],
+          ),
+        ),
+        // 列表上方全宽区域（如创建文件按钮）
+        ?above,
+        // 文件列表
+        Expanded(
+          child: children.isEmpty
+              ? Center(
+                  child: Text(emptyText,
+                      style:
+                          const TextStyle(fontSize: 12, color: kTextSecondary)),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.symmetric(vertical: 4),
+                  itemCount: children.length,
+                  itemBuilder: (_, i) => children[i],
+                ),
+        ),
+      ],
+    );
+  }
+
+  /// 项目区"创建文件"全宽渐变按钮：点击新建文件，保存到 files/ 目录。
+  Widget _buildCreateFileButton() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+      child: GradientButton(
+        label: '创建文件',
+        icon: Icons.add_rounded,
+        onPressed: _newFile,
+        expanded: true,
+      ),
+    );
+  }
+
+  /// 工作区可拖拽分隔线，调节左侧面板宽度。
+  Widget _buildWorkspaceDivider() {
+    return MouseRegion(
+      cursor: SystemMouseCursors.resizeColumn,
+      child: GestureDetector(
+        onHorizontalDragStart: (_) =>
+            setState(() => _isWorkspaceDragging = true),
+        onHorizontalDragUpdate: (details) {
+          setState(() {
+            _workspaceWidth =
+                (_workspaceWidth + details.delta.dx).clamp(180, 320);
+          });
+        },
+        onHorizontalDragEnd: (_) =>
+            setState(() => _isWorkspaceDragging = false),
+        child: Container(
+          width: 5,
+          color: Colors.transparent,
+          child: Center(
+            child: Container(
+              width: 1,
+              color: _isWorkspaceDragging ? kAccent : kBorder,
+            ),
+          ),
         ),
       ),
     );
@@ -386,6 +932,11 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
               icon: Icons.settings_rounded,
               tooltip: '设置',
               onTap: _showSettings),
+          const SizedBox(width: 6),
+          _IconBtn(
+              icon: Icons.refresh_rounded,
+              tooltip: '刷新',
+              onTap: _reloadFile),
           _toolbarSeparator(),
           _buildFileName(),
         ],
@@ -672,6 +1223,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          _buildPreviewToolbar(),
           Expanded(
             child: _rawMarkdown.isEmpty
                 ? Center(
@@ -781,6 +1333,46 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     );
   }
 
+  /// 预览区顶部工具条：预览标签 + 导出 PDF / 导出图表 SVG 按钮。
+  Widget _buildPreviewToolbar() {
+    return Container(
+      height: 40,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: const BoxDecoration(
+        color: kPreviewBg,
+        border: Border(bottom: BorderSide(color: kBorder, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          const BrandIcon(
+              icon: Icons.visibility_rounded, size: 20, iconSize: 12),
+          const SizedBox(width: 8),
+          const Text('预览',
+              style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w600,
+                  color: kTextPrimary)),
+          const Spacer(),
+          _IconBtn(
+              icon: Icons.picture_as_pdf_rounded,
+              tooltip: '导出 PDF',
+              onTap: _exportPdf,
+              loading: _isExporting,
+              color: const Color(0xFFE2574C),
+              hoverColor: const Color(0xFFB71C1C)),
+          const SizedBox(width: 4),
+          _IconBtn(
+              icon: Icons.image_rounded,
+              tooltip: '导出图表 PNG',
+              onTap: _exportChartsPng,
+              loading: _isExportingPng,
+              color: const Color(0xFF2E7D32),
+              hoverColor: const Color(0xFF1B5E20)),
+        ],
+      ),
+    );
+  }
+
   // ── 底部状态栏 ─────────────────────────────────────────────────────────
 
   Widget _buildStatusBar() {
@@ -800,6 +1392,16 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       ),
       child: Row(
         children: [
+          // 品牌渐变竖条装饰
+          Container(
+            width: 3,
+            height: 14,
+            decoration: BoxDecoration(
+              gradient: kBrandGradient,
+              borderRadius: BorderRadius.circular(2),
+            ),
+          ),
+          const SizedBox(width: 10),
           ...status,
           const Spacer(),
           const _StatusItem('Markdown'),
@@ -819,83 +1421,129 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     var fontSize = _editorFontSize;
     var lineHeight = _editorLineHeight;
     var theme = _highlightTheme;
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => StatefulBuilder(
-        builder: (context, setDialogState) => AlertDialog(
-          title: const Text('编辑器设置'),
-          content: SizedBox(
-            width: 380,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Text('字号',
-                    style:
-                        TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 8),
-                SegmentedButton<double>(
-                  segments: const [
-                    ButtonSegment(value: 14, label: Text('14')),
-                    ButtonSegment(value: 15, label: Text('15')),
-                    ButtonSegment(value: 16, label: Text('16')),
-                  ],
-                  selected: {fontSize},
-                  onSelectionChanged: (s) =>
-                      setDialogState(() => fontSize = s.first),
-                ),
-                const SizedBox(height: 18),
-                const Text('行高',
-                    style:
-                        TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 8),
-                SegmentedButton<double>(
-                  segments: const [
-                    ButtonSegment(value: 1.6, label: Text('1.6')),
-                    ButtonSegment(value: 1.7, label: Text('1.7')),
-                    ButtonSegment(value: 1.8, label: Text('1.8')),
-                  ],
-                  selected: {lineHeight},
-                  onSelectionChanged: (s) =>
-                      setDialogState(() => lineHeight = s.first),
-                ),
-                const SizedBox(height: 18),
-                const Text('语法高亮主题',
-                    style:
-                        TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-                const SizedBox(height: 8),
-                SegmentedButton<String>(
-                  segments: kHighlightThemeNames.entries
-                      .map((e) =>
-                          ButtonSegment(value: e.key, label: Text(e.key)))
-                      .toList(),
-                  selected: {theme},
-                  onSelectionChanged: (s) =>
-                      setDialogState(() => theme = s.first),
-                ),
+    await showModernDialog<void>(
+      context,
+      StatefulBuilder(
+        builder: (context, setDialogState) => ModernDialogFrame(
+          icon: Icons.tune_rounded,
+          title: '编辑器设置',
+          subtitle: '调整编辑体验',
+          width: 400,
+          actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('取消'),
+          ),
+          GradientButton(
+            label: '应用',
+            icon: Icons.check_rounded,
+            onPressed: () {
+              setState(() {
+                _editorFontSize = fontSize;
+                _editorLineHeight = lineHeight;
+                _highlightTheme =
+                    kHighlightThemeNames[theme] ?? _highlightTheme;
+              });
+              Navigator.of(context).pop();
+            },
+          ),
+        ],
+        children: [
+          _settingLabel(Icons.format_size_rounded, _cFontSize, '字号'),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<double>(
+              segments: const [
+                ButtonSegment(value: 14, label: Text('14')),
+                ButtonSegment(value: 15, label: Text('15')),
+                ButtonSegment(value: 16, label: Text('16')),
               ],
+              selected: {fontSize},
+              onSelectionChanged: (s) =>
+                  setDialogState(() => fontSize = s.first),
+              style: _segmentedStyle(_cFontSize),
             ),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(dialogContext).pop(),
-              child: const Text('取消'),
+          const SizedBox(height: 20),
+          _settingLabel(Icons.format_line_spacing_rounded, _cLineHeight, '行高'),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<double>(
+              segments: const [
+                ButtonSegment(value: 1.6, label: Text('1.6')),
+                ButtonSegment(value: 1.7, label: Text('1.7')),
+                ButtonSegment(value: 1.8, label: Text('1.8')),
+              ],
+              selected: {lineHeight},
+              onSelectionChanged: (s) =>
+                  setDialogState(() => lineHeight = s.first),
+              style: _segmentedStyle(_cLineHeight),
             ),
-            FilledButton(
-              onPressed: () {
-                setState(() {
-                  _editorFontSize = fontSize;
-                  _editorLineHeight = lineHeight;
-                  _highlightTheme =
-                      kHighlightThemeNames[theme] ?? _highlightTheme;
-                });
-                Navigator.of(dialogContext).pop();
-              },
-              child: const Text('确定'),
+          ),
+          const SizedBox(height: 20),
+          _settingLabel(Icons.palette_rounded, _cTheme, '语法高亮主题'),
+          const SizedBox(height: 10),
+          SizedBox(
+            width: double.infinity,
+            child: SegmentedButton<String>(
+              segments: kHighlightThemeNames.entries
+                  .map((e) => ButtonSegment(value: e.key, label: Text(e.key)))
+                  .toList(),
+              selected: {theme},
+              onSelectionChanged: (s) => setDialogState(() => theme = s.first),
+              style: _segmentedStyle(_cTheme),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
+      ),
+    );
+  }
+
+  // ── 设置弹窗辅助 ────────────────────────────────────────────────────────
+
+  static const _cFontSize = Color(0xFF448AFF); // 蓝
+  static const _cLineHeight = Color(0xFF00BFA5); // 青
+  static const _cTheme = Color(0xFF7C4DFF); // 紫
+
+  /// 设置项标题：彩色圆底图标 + 文字。
+  Widget _settingLabel(IconData icon, Color color, String text) {
+    return Row(
+      children: [
+        Container(
+          width: 26,
+          height: 26,
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: 0.12),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(icon, size: 15, color: color),
+        ),
+        const SizedBox(width: 8),
+        Text(text,
+            style: const TextStyle(
+                fontSize: 13, fontWeight: FontWeight.w600, color: kTextPrimary)),
+      ],
+    );
+  }
+
+  /// 分段按钮样式：选中时填充主题色。
+  ButtonStyle _segmentedStyle(Color color) {
+    return ButtonStyle(
+      visualDensity: VisualDensity.compact,
+      textStyle: const WidgetStatePropertyAll(TextStyle(fontSize: 12.5)),
+      backgroundColor: WidgetStateProperty.resolveWith((states) =>
+          states.contains(WidgetState.selected) ? color : Colors.transparent),
+      foregroundColor: WidgetStateProperty.resolveWith((states) =>
+          states.contains(WidgetState.selected) ? Colors.white : kTextSecondary),
+      side: WidgetStateProperty.resolveWith((states) =>
+          states.contains(WidgetState.selected)
+              ? BorderSide(color: color)
+              : const BorderSide(color: kBorder)),
+      shape: WidgetStatePropertyAll(
+          RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
     );
   }
 }
@@ -922,7 +1570,12 @@ class _MermaidCodeBlockBuilder extends MarkdownElementBuilder {
 class _TitleBarBtn extends StatefulWidget {
   final IconData icon;
   final VoidCallback onTap;
-  const _TitleBarBtn({required this.icon, required this.onTap});
+  final bool danger; // 关闭按钮 hover 红色
+  const _TitleBarBtn({
+    required this.icon,
+    required this.onTap,
+    this.danger = false,
+  });
 
   @override
   State<_TitleBarBtn> createState() => _TitleBarBtnState();
@@ -933,6 +1586,7 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
 
   @override
   Widget build(BuildContext context) {
+    final hoverBg = widget.danger ? Colors.red : kAccent;
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
@@ -944,12 +1598,14 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
           width: 28,
           height: 28,
           decoration: BoxDecoration(
-            color: _hovered
-                ? Colors.black.withValues(alpha: 0.08)
-                : Colors.transparent,
+            color: _hovered ? hoverBg : Colors.transparent,
             borderRadius: BorderRadius.circular(6),
           ),
-          child: Icon(widget.icon, color: Colors.black54, size: 16),
+          child: Icon(widget.icon,
+              size: 16,
+              color: _hovered
+                  ? Colors.white
+                  : (widget.danger ? Colors.black54 : kTextSecondary)),
         ),
       ),
     );
@@ -958,39 +1614,76 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
 
 // ─── 工具栏图标按钮 ─────────────────────────────────────────────────────────
 
-class _IconBtn extends StatelessWidget {
+class _IconBtn extends StatefulWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback? onTap;
   final bool enabled;
+  final bool loading; // 显示转圈并禁用点击
+  final Color? color; // 常态图标色；null 用 kTextPrimary
+  final Color? hoverColor; // hover 图标色；null 用 kAccent
 
   const _IconBtn({
     required this.icon,
     required this.tooltip,
     this.onTap,
     this.enabled = true,
+    this.loading = false,
+    this.color,
+    this.hoverColor,
   });
 
   @override
+  State<_IconBtn> createState() => _IconBtnState();
+}
+
+class _IconBtnState extends State<_IconBtn> {
+  bool _hovered = false;
+
+  @override
   Widget build(BuildContext context) {
-    final active = enabled && onTap != null;
-    return Tooltip(
-      message: tooltip,
-      waitDuration: const Duration(milliseconds: 400),
-      child: Material(
-        color: Colors.transparent,
-        borderRadius: BorderRadius.circular(6),
-        child: InkWell(
+    final active = widget.enabled && widget.onTap != null && !widget.loading;
+    final hoverColor = widget.hoverColor ?? kAccent;
+    final color = !active
+        ? kTextSecondary.withValues(alpha: 0.35)
+        : _hovered
+            ? hoverColor
+            : (widget.color ?? kTextPrimary);
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      cursor: active ? SystemMouseCursors.click : SystemMouseCursors.basic,
+      child: Tooltip(
+        message: widget.tooltip,
+        waitDuration: const Duration(milliseconds: 400),
+        child: Material(
+          color: Colors.transparent,
           borderRadius: BorderRadius.circular(6),
-          onTap: active ? onTap : null,
-          child: SizedBox(
-            width: 30,
-            height: 30,
-            child: Icon(icon,
-                size: 17,
-                color: active
-                    ? kTextPrimary
-                    : kTextSecondary.withValues(alpha: 0.35)),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: active ? widget.onTap : null,
+            splashColor: hoverColor.withValues(alpha: 0.15),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: active && _hovered
+                    ? hoverColor.withValues(alpha: 0.12)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: widget.loading
+                  ? SizedBox(
+                      width: 11,
+                      height: 11,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 1.5,
+                        color: widget.color ?? kAccent,
+                      ),
+                    )
+                  : Icon(widget.icon, size: 17, color: color),
+            ),
           ),
         ),
       ),
@@ -1020,6 +1713,166 @@ class _HeadingMenu extends StatelessWidget {
         PopupMenuItem(value: 5, child: Text('H5')),
         PopupMenuItem(value: 6, child: Text('H6')),
       ],
+    );
+  }
+}
+
+// ─── 新建文件输入框 ─────────────────────────────────────────────────────────
+
+/// 新建文件名输入框：内部持有并释放 TextEditingController，
+/// 生命周期与对话框 widget 绑定，避免退场动画期间 controller 已被 dispose。
+class _FileNameField extends StatefulWidget {
+  final ValueChanged<String> onChanged;
+  final ValueChanged<String> onSubmitted;
+  const _FileNameField({required this.onChanged, required this.onSubmitted});
+
+  @override
+  State<_FileNameField> createState() => _FileNameFieldState();
+}
+
+class _FileNameFieldState extends State<_FileNameField> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: _controller,
+      autofocus: true,
+      onChanged: widget.onChanged,
+      onSubmitted: widget.onSubmitted,
+      decoration: const InputDecoration(
+        hintText: '例如：笔记.md',
+        isDense: true,
+        border: OutlineInputBorder(),
+      ),
+    );
+  }
+}
+
+// ─── 工作区列表项 ───────────────────────────────────────────────────────────
+
+/// 工作区文件列表项：hover 高亮，当前打开文件高亮 + 左侧强调条。
+class _WorkspaceListItem extends StatefulWidget {
+  final String label;
+  final String? sublabel;
+  final bool active;
+  final VoidCallback onTap;
+  const _WorkspaceListItem({
+    required this.label,
+    this.sublabel,
+    required this.active,
+    required this.onTap,
+  });
+
+  @override
+  State<_WorkspaceListItem> createState() => _WorkspaceListItemState();
+}
+
+class _WorkspaceListItemState extends State<_WorkspaceListItem> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final bg = widget.active
+        ? kAccent.withValues(alpha: 0.12)
+        : (_hovered ? Colors.black.withValues(alpha: 0.04) : Colors.transparent);
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          decoration: BoxDecoration(
+            color: bg,
+            border: Border(
+              left: BorderSide(
+                  color: widget.active ? kAccent : Colors.transparent, width: 3),
+            ),
+          ),
+          child: Row(
+            children: [
+              widget.active
+                  ? const BrandIcon(
+                      icon: Icons.description_rounded,
+                      size: 20,
+                      iconSize: 12)
+                  : Icon(Icons.insert_drive_file_outlined,
+                      size: 14, color: kTextSecondary),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Tooltip(
+                  message: widget.sublabel ?? widget.label,
+                  child: Text(
+                    widget.label,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: widget.active ? kAccent : kTextPrimary,
+                      fontWeight:
+                          widget.active ? FontWeight.w600 : FontWeight.w400,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ─── 面板迷你按钮 ───────────────────────────────────────────────────────────
+
+/// 面板标题行上的小型图标按钮（刷新 / 清空）。
+class _MiniBtn extends StatefulWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+  const _MiniBtn(
+      {required this.icon, required this.tooltip, required this.onTap});
+
+  @override
+  State<_MiniBtn> createState() => _MiniBtnState();
+}
+
+class _MiniBtnState extends State<_MiniBtn> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovered = true),
+      onExit: (_) => setState(() => _hovered = false),
+      cursor: SystemMouseCursors.click,
+      child: Tooltip(
+        message: widget.tooltip,
+        child: GestureDetector(
+          onTap: widget.onTap,
+          child: Container(
+            width: 24,
+            height: 24,
+            decoration: BoxDecoration(
+              color: _hovered
+                  ? kAccent.withValues(alpha: 0.12)
+                  : Colors.transparent,
+              borderRadius: BorderRadius.circular(5),
+            ),
+            child: Icon(widget.icon,
+                size: 14,
+                color: _hovered ? kAccent : kTextSecondary),
+          ),
+        ),
+      ),
     );
   }
 }

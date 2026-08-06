@@ -38,8 +38,8 @@ class _MermaidViewState extends State<MermaidView>
   /// flutter_assets 磁盘根路径，全局只解析一次。
   static String? _assetsRoot;
 
-  /// source → 最近一次缩放比例。flutter_markdown 用 ListView 懒加载，图滚出
-  /// 屏幕 State 会被销毁、滚回来重建 WebView，用缓存恢复上次缩放。
+  /// source → 用户手动调整过的缩放比例。只有手动调整才缓存；自动适配结果
+  /// 不缓存，这样 WebView 重建后仍能按图内容重新适配。
   static final Map<String, double> _zoomCache = {};
 
   final WebviewController _controller = WebviewController();
@@ -49,18 +49,24 @@ class _MermaidViewState extends State<MermaidView>
   bool _ready = false;
   bool _webviewInitialized = false;
   String? _initError;
-  double _zoom = 0.5;
+  /// -1 = 缩放未定，由 JS 端按图内容自动计算；>0 = 具体缩放比例。
+  double _zoom = -1;
+  /// 是否被用户手动调整过（Ctrl+滚轮 / 缩放条）。自动适配结果不视为手动，
+  /// 这样图翻页回来后仍能按内容重新适配。
+  bool _userAdjusted = false;
 
   @override
   void initState() {
     super.initState();
-    _zoom = _zoomCache[widget.source] ?? 0.5;
+    _loadZoomFromCache();
     _init();
   }
 
   @override
   void dispose() {
-    _zoomCache[widget.source] = _zoom;
+    if (_userAdjusted) {
+      _zoomCache[widget.source] = _zoom;
+    }
     _debounce?.cancel();
     for (final sub in _subs) {
       sub.cancel();
@@ -73,9 +79,16 @@ class _MermaidViewState extends State<MermaidView>
   void didUpdateWidget(covariant MermaidView oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (widget.source != oldWidget.source) {
-      _zoom = _zoomCache[widget.source] ?? 0.5;
+      _loadZoomFromCache();
       _scheduleRender();
     }
+  }
+
+  /// 从缓存恢复手动缩放；没有缓存则交给 JS 端按内容自动适配。
+  void _loadZoomFromCache() {
+    final cached = _zoomCache[widget.source];
+    _userAdjusted = cached != null;
+    _zoom = cached ?? -1;
   }
 
   Future<void> _init() async {
@@ -136,9 +149,11 @@ class _MermaidViewState extends State<MermaidView>
   void _renderCurrent() {
     if (!_webviewInitialized) return;
     final b64 = base64Encode(utf8.encode(widget.source));
+    // 未手动调整过就传 -1，让 JS 端按图内容自动算默认缩放
+    final target = _userAdjusted ? _zoom : -1.0;
     try {
       _controller.executeScript(
-          "window.__targetScale = $_zoom; window.__renderMermaid('$b64');");
+          "window.__targetScale = $target; window.__renderMermaid('$b64');");
     } catch (e) {
       LogService.error('MermaidView 执行渲染 JS 失败', exception: e, category: 'system');
     }
@@ -146,10 +161,18 @@ class _MermaidViewState extends State<MermaidView>
 
   void _onWebMessage(dynamic msg) {
     final s = '$msg';
+    // JS 按图内容自动算出的默认缩放，只同步显示，不视为手动调整
+    if (s.startsWith('__autoZoom:')) {
+      final z = double.tryParse(s.substring(11));
+      if (z == null || !mounted || z == _zoom) return;
+      setState(() => _zoom = z);
+      return;
+    }
     // Ctrl+滚轮缩放后，JS 用 __zoom:N 前缀同步缩放比例
     if (s.startsWith('__zoom:')) {
       final z = double.tryParse(s.substring(7));
       if (z == null || !mounted || z == _zoom) return;
+      _userAdjusted = true;
       setState(() => _zoom = z);
       return;
     }
@@ -162,21 +185,31 @@ class _MermaidViewState extends State<MermaidView>
     setState(() => _contentHeight = height);
   }
 
-  static const _minZoom = 0.3;
+  static const _minZoom = 0.35;
   static const _maxZoom = 3.0;
 
   void _changeZoom(double delta) {
     if (!_webviewInitialized) return;
-    final next = (_zoom + delta).clamp(_minZoom, _maxZoom).toDouble();
+    // _zoom 还没同步到自动值时，按 100% 起步
+    final base = _zoom > 0 ? _zoom : 1.0;
+    final next = (base + delta).clamp(_minZoom, _maxZoom).toDouble();
     if (next == _zoom) return;
+    _userAdjusted = true;
     setState(() => _zoom = next);
     _executeZoom(next);
   }
 
+  /// 重置 = 清除手动调整与缓存，回到 JS 端按图内容重新自动适配。
   void _resetZoom() {
-    if (!_webviewInitialized || _zoom == 1.0) return;
-    setState(() => _zoom = 1.0);
-    _executeZoom(1.0);
+    if (!_webviewInitialized) return;
+    _userAdjusted = false;
+    _zoomCache.remove(widget.source);
+    setState(() => _zoom = -1);
+    try {
+      _controller.executeScript('window.__setAutoZoom();');
+    } catch (e) {
+      LogService.error('MermaidView 重置缩放失败', exception: e, category: 'system');
+    }
   }
 
   void _executeZoom(double zoom) {
@@ -261,7 +294,7 @@ class _ZoomBar extends StatelessWidget {
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 2),
             child: Text(
-              '${(zoom * 100).round()}%',
+              zoom > 0 ? '${(zoom * 100).round()}%' : '自动',
               style: const TextStyle(color: Colors.white70, fontSize: 11),
             ),
           ),
@@ -304,7 +337,7 @@ const _htmlTemplate = r'''<!DOCTYPE html>
 <style>
   html, body { margin:0; padding:0; background:#ffffff; overflow:hidden; }
   #diagram { display:flex; justify-content:center; padding:12px; box-sizing:border-box; }
-  #diagram svg { max-width:100% !important; height:auto !important; display:block; }
+  #diagram svg { max-width:100%; height:auto; display:block; }
   .err { color:#ff6b6b; font-family:Consolas,monospace; font-size:13px; white-space:pre-wrap; word-break:break-all; }
 </style>
 </head>
@@ -326,40 +359,42 @@ const _htmlTemplate = r'''<!DOCTYPE html>
     fontFamily: 'Microsoft YaHei'
   });
 
-  // SVG 适应宽度后的基准宽度 + 高度上报（__setZoom 复用）
-  var _baseW = 0;
-  // 默认缩放比例：每次渲染完成后自动应用
-  var _defaultScale = 0.5;
+  // 图适应容器宽度后的实际显示宽度 / viewBox 自然宽度 / 按内容自动适配的比例
+  var _fitW = 0;
+  var _naturalW = 0;
+  var _fitScale = 0.5;
+  var _minScale = 0.35;
   function _postHeight() {
     var el = document.getElementById('diagram');
     window.chrome.webview.postMessage(String(el.scrollHeight || el.offsetHeight || 300));
   }
 
-  // 缩放：scale=1 回到适应宽度（无滚动条）；>1 放大并放开滚动以查看细节
+  // 缩放：scale 是相对图自然宽的比例（1 = 原始尺寸）。不超过容器宽时居中
+  // 完整显示、无滚动条；放大超过容器宽才放开滚动以查看细节。
   window.__setZoom = function(scale) {
     window.__currentScale = scale;
     var svg = document.querySelector('#diagram svg');
-    if (!svg || !_baseW) return;
+    if (!svg || !_naturalW) {
+      _postHeight();
+      return;
+    }
     var html = document.documentElement;
-    if (scale > 1.001) {
-      html.style.overflow = 'auto';
-      document.body.style.overflow = 'auto';
-    } else {
-      html.style.overflow = 'hidden';
-      document.body.style.overflow = 'hidden';
-    }
-    if (Math.abs(scale - 1) <= 0.001) {
-      // 重置：回到适应宽度
-      svg.style.maxWidth = '100%';
-      svg.style.width = '';
-      svg.style.height = 'auto';
-    } else {
-      // 缩小或放大：按基准宽度乘比例
-      svg.style.maxWidth = 'none';
-      svg.style.width = Math.round(_baseW * scale) + 'px';
-      svg.style.height = 'auto';
-    }
+    // 放大超过容器宽度才开滚动看细节；适应/缩小时居中完整显示
+    var fits = Math.round(_naturalW * scale) <=
+        (document.getElementById('diagram').clientWidth + 1);
+    html.style.overflow = fits ? 'hidden' : 'auto';
+    document.body.style.overflow = fits ? 'hidden' : 'auto';
+    svg.style.maxWidth = 'none';
+    svg.style.width = Math.round(_naturalW * scale) + 'px';
+    svg.style.height = 'auto';
     _postHeight();
+  };
+
+  // 回到按图内容自动适配的默认缩放（重置按钮）
+  window.__setAutoZoom = function() {
+    if (!_fitScale) return;
+    __setZoom(_fitScale);
+    window.chrome.webview.postMessage('__autoZoom:' + Math.round(_fitScale * 100));
   };
 
   // Ctrl+滚轮 → 统一走 __setZoom，preventDefault 阻止页面滚动和 WebView2 内置
@@ -367,8 +402,8 @@ const _htmlTemplate = r'''<!DOCTYPE html>
   document.addEventListener('wheel', function(e) {
     if (!e.ctrlKey) return;
     e.preventDefault();
-    var cur = window.__currentScale || _defaultScale;
-    var next = Math.min(3, Math.max(0.3, cur + (e.deltaY < 0 ? 0.2 : -0.2)));
+    var cur = window.__currentScale || _fitScale;
+    var next = Math.min(3, Math.max(_minScale, cur + (e.deltaY < 0 ? 0.2 : -0.2)));
     __setZoom(next);
     window.chrome.webview.postMessage('__zoom:' + Math.round(next * 100));
   }, { passive: false });
@@ -388,20 +423,31 @@ const _htmlTemplate = r'''<!DOCTYPE html>
         svg.removeAttribute('style');
         svg.setAttribute('style',
             'max-width:100%;height:auto;display:block;');
-        _baseW = svg.getBoundingClientRect().width || 0;
+        // 自然宽度优先取 viewBox，退化用实际渲染宽度
+        var vbW = 0;
+        var vb = svg.getAttribute('viewBox');
+        if (vb) {
+          var parts = vb.trim().split(/[\s,]+/).map(Number);
+          if (parts.length >= 4 && isFinite(parts[2])) vbW = parts[2];
+        }
+        _fitW = svg.getBoundingClientRect().width || 0;  // 适应容器后的宽度
+        _naturalW = vbW > 0 ? vbW : _fitW;
+        // 自动适配：小图原尺寸（1.0），大图缩到刚好适应容器宽，保底可读
+        _fitScale = _naturalW > 0
+            ? Math.max(_minScale, Math.min(1, _fitW / _naturalW))
+            : 1;
       }
     } catch (e) {
       el.innerHTML = '<div class="err">Mermaid 渲染失败:\n' +
           (e && e.message ? e.message : String(e)) + '</div>';
     }
-    // 应用缩放：优先用 Flutter 端设置的 __targetScale（翻页重建后恢复上次缩放），
-    // 否则用默认 _defaultScale（=50%）
+    // 应用缩放：Flutter 端手动调整过就恢复其值，否则按图内容自动适配
     var target = (window.__targetScale && window.__targetScale > 0)
-        ? window.__targetScale : _defaultScale;
-    if (Math.abs(target - 1) > 0.001) {
-      __setZoom(target);   // 应用缩放，内部会上报高度
-    } else {
-      _postHeight();
+        ? window.__targetScale : _fitScale;
+    __setZoom(target);
+    if (!(window.__targetScale && window.__targetScale > 0)) {
+      // 自动适配结果同步给 Flutter（不标记为手动调整）
+      window.chrome.webview.postMessage('__autoZoom:' + Math.round(_fitScale * 100));
     }
   };
 })();
