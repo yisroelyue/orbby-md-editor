@@ -458,7 +458,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       return;
     }
     final outputPath = await FilePicker.platform.saveFile(
-      dialogTitle: '导出 PDF',
+      dialogTitle: '导出为PDF',
       fileName: '文档.pdf',
       type: FileType.custom,
       allowedExtensions: ['pdf'],
@@ -648,9 +648,9 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
             const SizedBox(width: 6),
             const BrandIcon(icon: Icons.code_rounded, size: 24, iconSize: 15),
             const SizedBox(width: 10),
-            const Text('OrbbyMDEditor',
+            const Text('Orbby Markdown 编辑器',
                 style: TextStyle(
-                    color: kTextPrimary,
+                    color: kTextPrimary,  
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                     decoration: TextDecoration.none)),
@@ -667,7 +667,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
             const SizedBox(width: 4),
             _TitleBarBtn(
                 icon: Icons.close_rounded,
-                onTap: () => windowManager.destroy(),
+                onTap: () => windowManager.close(),
                 danger: true),
           ],
         ),
@@ -944,7 +944,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     );
   }
 
-  /// 第二行：文本格式栏 —— Markdown 快捷操作 + 撤销/重做 + 字数
+  /// 第二行：文本格式栏 —— Markdown 快捷操作 + 撤销/重做
   Widget _buildFormatBar() {
     return Container(
       height: 40,
@@ -988,9 +988,6 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
               tooltip: '重做',
               onTap: _controller.redo,
               enabled: _controller.canRedo),
-          const Spacer(),
-          Text('字数 $_charCount',
-              style: const TextStyle(fontSize: 12, color: kTextSecondary)),
         ],
       ),
     );
@@ -1333,7 +1330,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     );
   }
 
-  /// 预览区顶部工具条：预览标签 + 导出 PDF / 导出图表 SVG 按钮。
+  /// 预览区顶部工具条：左端放置导出 PDF / 导出图表 PNG 按钮。
   Widget _buildPreviewToolbar() {
     return Container(
       height: 40,
@@ -1344,18 +1341,9 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       ),
       child: Row(
         children: [
-          const BrandIcon(
-              icon: Icons.visibility_rounded, size: 20, iconSize: 12),
-          const SizedBox(width: 8),
-          const Text('预览',
-              style: TextStyle(
-                  fontSize: 12,
-                  fontWeight: FontWeight.w600,
-                  color: kTextPrimary)),
-          const Spacer(),
           _IconBtn(
               icon: Icons.picture_as_pdf_rounded,
-              tooltip: '导出 PDF',
+              tooltip: '导出为 PDF',
               onTap: _exportPdf,
               loading: _isExporting,
               color: const Color(0xFFE2574C),
@@ -1363,11 +1351,12 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
           const SizedBox(width: 4),
           _IconBtn(
               icon: Icons.image_rounded,
-              tooltip: '导出图表 PNG',
+              tooltip: '导出文件中的所有图表为图片',
               onTap: _exportChartsPng,
               loading: _isExportingPng,
               color: const Color(0xFF2E7D32),
               hoverColor: const Color(0xFF1B5E20)),
+          const Spacer(),
         ],
       ),
     );
