@@ -1,17 +1,22 @@
-# orbby_md_editor
+# Orbby Markdown 编辑器
 
-orbby-md-editor
+独立的 Markdown 编辑与预览工具，支持 Mermaid 图表渲染、PDF 导出与工作区管理。
 
-## Getting Started
+## 下载
 
-This project is a starting point for a Flutter application.
+最新版本：[orbby_md_editor_v1.0.0_windows_x64.zip](dist/orbby_md_editor_v1.0.0_windows_x64.zip)
 
-A few resources to get you started if this is your first Flutter project:
+下载后解压到任意目录，运行 `orbby_md_editor.exe` 即可，绿色免安装。
 
-- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
-- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+## 运行
 
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+```bash
+flutter pub get
+flutter run -d windows
+```
+
+## 构建
+
+```powershell
+.\package.ps1   # 构建 Release 并生成 dist/ 下的版本压缩包
+```
