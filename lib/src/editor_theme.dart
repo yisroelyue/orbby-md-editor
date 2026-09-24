@@ -24,12 +24,11 @@ const kAccent = Color(0xFF448AFF);
 
 /// 编辑区等宽字体：JetBrains Mono / Cascadia Code / Consolas / monospace。
 /// 中文通过 fallback 落到 Microsoft YaHei。
-const kEditorFontFamily = 'Cascadia Code';
+const kEditorFontFamily = 'Microsoft YaHei';
 const kEditorFontFallback = <String>[
-  'JetBrains Mono',
-  'Consolas',
-  'monospace',
-  'Microsoft YaHei',
+  'Microsoft YaHei UI',
+  'Arial',
+  'sans-serif',
 ];
 
 // ─── Markdown 语法高亮主题 ────────────────────────────────────────────────

@@ -4,6 +4,9 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:flutter_math_fork/flutter_math.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:markdown/markdown.dart' as md;
 import 'package:re_editor/re_editor.dart';
 import 'package:screen_retriever/screen_retriever.dart';
@@ -33,6 +36,10 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
 
   double _dividerPosition = 0.46;
   bool _isDragging = false;
+  bool _showWorkspace = false;
+  bool _showMenu = false;
+  // 默认只显示预览区，可通过文件名左侧按钮打开编辑区。
+  bool _showEditor = false;
   bool _isMaximized = false;
   Rect _restoreBounds = const Rect.fromLTWH(0, 0, 1400, 1000);
   String? _currentFilePath;
@@ -130,6 +137,19 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   }
 
   String get _rawMarkdown => _controller.text;
+
+  Future<void> _openMarkdownLink(String text, String? href, String title) async {
+    if (href == null) return;
+    final uri = Uri.tryParse(href);
+    if (uri == null) return;
+    await launchUrl(uri, mode: LaunchMode.externalApplication);
+  }
+
+  /// 将块级 LaTeX 公式转换为内部 math 代码块，交给公式组件渲染。
+  String get _markdownWithMathBlocks => _rawMarkdown.replaceAllMapped(
+        RegExp(r'\$\$\s*([\s\S]*?)\s*\$\$', multiLine: true),
+        (match) => '\n\n```math\n${match.group(1)!.trim()}\n```\n\n',
+      );
   int get _charCount => _controller.text.length;
   int get _lineCount => _controller.lineCount;
   bool get _isDirty => _controller.text != _savedBaseline;
@@ -513,6 +533,64 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   }
 
   /// 当前文件名去掉扩展名；未命名文件返回「未命名」。
+  Future<void> _showExportDialog() async {
+    if (_isExporting || _isExportingPng) return;
+    final mode = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => Dialog(
+        elevation: 8,
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 28),
+        child: Container(
+          width: 360,
+          padding: const EdgeInsets.fromLTRB(20, 18, 20, 14),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: const [
+              BoxShadow(
+                  color: Color(0x26000000), blurRadius: 24, offset: Offset(0, 8)),
+            ],
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const Text('导出',
+                  style: TextStyle(
+                      fontSize: 17,
+                      fontWeight: FontWeight.w700,
+                      color: kTextPrimary)),
+              const SizedBox(height: 4),
+              const Text('选择导出模式',
+                  style: TextStyle(fontSize: 12, color: kTextSecondary)),
+              const SizedBox(height: 14),
+              _ExportModeTile(
+                icon: Icons.picture_as_pdf_rounded,
+                title: '导出 PDF',
+                subtitle: '将预览内容导出为 PDF 文件',
+                onTap: () => Navigator.of(dialogContext).pop('pdf'),
+              ),
+              const SizedBox(height: 8),
+              _ExportModeTile(
+                icon: Icons.image_rounded,
+                title: '导出图片',
+                subtitle: '导出文档中的 Mermaid 图表',
+                onTap: () => Navigator.of(dialogContext).pop('image'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    if (mode == 'pdf') {
+      await _exportPdf();
+    } else if (mode == 'image') {
+      await _exportChartsPng();
+    }
+  }
+
   String get _fileNameStem {
     if (_currentFilePath == null) return '未命名';
     final base = _currentFilePath!.split(Platform.pathSeparator).last;
@@ -606,22 +684,23 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
             _buildTitleBar(),
             Expanded(
               child: Row(
-                children: [
+                  children: [
                   // 左侧工作区：项目文件 + 历史
-                  _buildWorkspace(),
-                  _buildWorkspaceDivider(),
+                  if (_showWorkspace) ...[
+                    _buildWorkspace(),
+                    _buildWorkspaceDivider(),
+                  ],
                   Expanded(
                     child: Column(
                       children: [
-                        _buildToolbar(),
-                        _buildFormatBar(),
+                        if (_showEditor) _buildFormatBar(),
                         Expanded(child: _buildSplitView()),
                       ],
                     ),
                   ),
-                ],
+                  ],
+                ),
               ),
-            ),
             _buildStatusBar(),
           ],
         ),
@@ -635,7 +714,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     return GestureDetector(
       onPanStart: (_) => windowManager.startDragging(),
       child: Container(
-        height: 36,
+        height: 44,
         padding: const EdgeInsets.symmetric(horizontal: 8),
         decoration: const BoxDecoration(
           gradient: LinearGradient(
@@ -646,15 +725,43 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
         child: Row(
           children: [
             const SizedBox(width: 6),
-            const BrandIcon(icon: Icons.code_rounded, size: 24, iconSize: 15),
-            const SizedBox(width: 10),
-            const Text('Orbby Markdown 编辑器',
-                style: TextStyle(
-                    color: kTextPrimary,  
-                    fontSize: 13,
-                    fontWeight: FontWeight.w600,
-                    decoration: TextDecoration.none)),
+            _TitleBarBtn(
+                icon: Icons.menu_rounded,
+                buttonSize: 36,
+                iconSize: 21,
+                hoverColor: kTextSecondary,
+                onTap: () => setState(() {
+                  _showMenu = !_showMenu;
+                  _showWorkspace = _showMenu;
+                })),
+            if (_showMenu) ...[
+              const SizedBox(width: 6),
+              _IconBtn(icon: Icons.folder_open_rounded, tooltip: '打开文件', onTap: _openFile, color: kTextSecondary),
+              _IconBtn(icon: Icons.settings_rounded, tooltip: '设置', onTap: _showSettings, color: kTextSecondary),
+              _IconBtn(icon: Icons.refresh_rounded, tooltip: '刷新', onTap: _reloadFile, color: kTextSecondary),
+              _IconBtn(
+                  icon: Icons.file_download_outlined,
+                  tooltip: '导出',
+                  onTap: _showExportDialog,
+                  loading: _isExporting || _isExportingPng,
+                  color: kTextSecondary),
+              _toolbarSeparator(),
+            ],
+            const SizedBox(width: 4),
+            _buildFileName(),
             const Spacer(),
+            _IconBtn(
+                icon: _showEditor ? Icons.edit_off_rounded : Icons.edit_rounded,
+                tooltip: _showEditor ? '隐藏编辑区' : '显示编辑区',
+                color: kTextSecondary.withValues(alpha: 0.7),
+                hoverColor: kTextSecondary,
+                onTap: () => setState(() => _showEditor = !_showEditor)),
+            Container(
+              width: 1,
+              height: 20,
+              margin: const EdgeInsets.symmetric(horizontal: 10),
+              color: kBorder.withValues(alpha: 0.45),
+            ),
             _TitleBarBtn(
                 icon: Icons.minimize_rounded,
                 onTap: () => windowManager.minimize()),
@@ -688,13 +795,14 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
           Expanded(
             flex: 3,
             child: _buildFileListPanel(
-              title: '项目文件',
-              icon: Icons.folder_rounded,
+              title: 'Project',
               onAction: _refreshWorkspace,
               actionIcon: Icons.refresh_rounded,
+              leadingAction: _newFile,
+              leadingActionIcon: Icons.add_rounded,
+              leadingActionTooltip: '创建文件',
               actionTooltip: '刷新',
               emptyText: '暂无文件',
-              above: _buildCreateFileButton(),
               children: _projectFiles
                   .map((p) => _buildProjectFileItem(p))
                   .toList(),
@@ -705,8 +813,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
           Expanded(
             flex: 2,
             child: _buildFileListPanel(
-              title: '历史',
-              icon: Icons.history_rounded,
+              title: 'Recent Files',
               onAction: _clearHistory,
               actionIcon: Icons.delete_sweep_rounded,
               actionTooltip: '清空历史',
@@ -808,12 +915,14 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   /// 通用文件列表面板：标题行（含操作按钮）+ 可选的列表上方全宽区域 + 列表。
   Widget _buildFileListPanel({
     required String title,
-    required IconData icon,
+    IconData? icon,
     required VoidCallback? onAction,
     required IconData actionIcon,
     required String actionTooltip,
+    VoidCallback? leadingAction,
+    IconData? leadingActionIcon,
+    String? leadingActionTooltip,
     required String emptyText,
-    Widget? above,
     required List<Widget> children,
   }) {
     return Column(
@@ -821,7 +930,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       children: [
         // 面板标题行
         Container(
-          height: 32,
+          height: 38,
           padding: const EdgeInsets.only(left: 10, right: 4),
           decoration: const BoxDecoration(
             color: kEditorPanelBg,
@@ -829,22 +938,32 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
           ),
           child: Row(
             children: [
-              BrandIcon(icon: icon, size: 20, iconSize: 12),
-              const SizedBox(width: 8),
+              if (icon != null) ...[
+                Icon(icon, size: 17, color: kTextSecondary),
+                const SizedBox(width: 8),
+              ],
               Text(title,
                   style: const TextStyle(
-                      fontSize: 12,
+                      fontSize: 13.5,
                       fontWeight: FontWeight.w600,
                       color: kTextPrimary)),
               const Spacer(),
+              if (leadingAction != null && leadingActionIcon != null)
+                _MiniBtn(
+                    icon: leadingActionIcon,
+                    tooltip: leadingActionTooltip ?? '',
+                    onTap: leadingAction,
+                    large: true),
               if (onAction != null)
                 _MiniBtn(
-                    icon: actionIcon, tooltip: actionTooltip, onTap: onAction),
+                    icon: actionIcon,
+                    tooltip: actionTooltip,
+                    onTap: onAction,
+                    large: leadingAction != null),
             ],
           ),
         ),
         // 列表上方全宽区域（如创建文件按钮）
-        ?above,
         // 文件列表
         Expanded(
           child: children.isEmpty
@@ -872,6 +991,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
         icon: Icons.add_rounded,
         onPressed: _newFile,
         expanded: true,
+        muted: true,
       ),
     );
   }
@@ -1009,7 +1129,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     // 去掉已有扩展名，统一以 .markdown 结尾
     final dot = base.lastIndexOf('.');
     final stem = dot > 0 ? base.substring(0, dot) : base;
-    final name = '$stem.markdown';
+    final name = '$stem.md';
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -1025,7 +1145,7 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
         ),
         Text(name,
             style: const TextStyle(
-                color: kTextPrimary, fontSize: 13, fontWeight: FontWeight.w600)),
+                color: kTextPrimary, fontSize: 13, fontWeight: FontWeight.w400)),
       ],
     );
   }
@@ -1033,6 +1153,8 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
   // ── 分割视图 ───────────────────────────────────────────────────────────
 
   Widget _buildSplitView() {
+    if (!_showEditor) return _buildPreviewPanel();
+
     return LayoutBuilder(
       builder: (context, constraints) {
         final totalWidth = constraints.maxWidth;
@@ -1220,88 +1342,94 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _buildPreviewToolbar(),
           Expanded(
             child: _rawMarkdown.isEmpty
                 ? Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.article_outlined,
-                            size: 40,
-                            color: kTextSecondary.withValues(alpha: 0.3)),
+                        SvgPicture.asset(
+                          'assets/无内容.svg',
+                          width: 180,
+                          height: 128,
+                        ),
                         const SizedBox(height: 10),
-                        const Text('在左侧输入 Markdown 开始预览',
-                            style: TextStyle(
-                                fontSize: 13, color: kTextSecondary)),
                       ],
                     ),
                   )
-                : SelectionArea(
-                    child: Markdown(
-                      data: _rawMarkdown,
-                      selectable: false,
-                      builders: {'code': _MermaidCodeBlockBuilder()},
+                : Markdown(
+                      data: _markdownWithMathBlocks,
+                      onTapLink: _openMarkdownLink,
+                      selectable: true,
+                      builders: {
+                        'code': _MermaidCodeBlockBuilder(),
+                      },
                       controller: _previewScrollController,
                       padding: const EdgeInsets.symmetric(
-                          horizontal: 24, vertical: 16),
+                          horizontal: 48, vertical: 16),
                       styleSheet: MarkdownStyleSheet(
                         h1: const TextStyle(
                             color: kTextPrimary,
-                            fontSize: 24,
+                            fontSize: 26,
                             fontWeight: FontWeight.w700,
-                            height: 2.2),
+                            height: 2.6),
                         h2: const TextStyle(
                             color: kTextPrimary,
-                            fontSize: 20,
+                            fontSize: 22,
                             fontWeight: FontWeight.w600,
-                            height: 2.0),
+                            height: 2.4),
                         h3: const TextStyle(
+                            color: kTextPrimary,
+                            fontSize: 19,
+                            fontWeight: FontWeight.w600,
+                            height: 2.2),
+                        h4: const TextStyle(
                             color: kTextPrimary,
                             fontSize: 17,
                             fontWeight: FontWeight.w600,
-                            height: 1.8),
-                        h4: const TextStyle(
-                            color: kTextPrimary,
-                            fontSize: 15,
-                            fontWeight: FontWeight.w600,
-                            height: 1.6),
+                            height: 2.0),
                         p: const TextStyle(
-                            color: kTextPrimary, fontSize: 14, height: 1.7),
+                            color: kTextPrimary, fontSize: 16, height: 1.7),
                         code: const TextStyle(
-                            color: Color(0xFFC7254E),
-                            fontSize: 13,
+                            color: Colors.black,
+                            fontSize: 15,
                             fontFamily: kEditorFontFamily),
+                        codeblockPadding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 20),
                         codeblockDecoration: BoxDecoration(
-                          color: const Color(0xFFF5F5F5),
+                          color: const Color(0xFFFAFAFA),
                           borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: kBorder, width: 0.5),
                         ),
                         blockquote: const TextStyle(
-                            color: kTextSecondary, fontSize: 14, height: 1.6),
+                            color: kTextSecondary, fontSize: 16, height: 1.6),
+                        blockquotePadding: const EdgeInsets.fromLTRB(
+                            14, 4, 8, 4),
                         blockquoteDecoration: BoxDecoration(
-                          color: kAccent.withValues(alpha: 0.06),
-                          borderRadius: BorderRadius.circular(4),
+                          color: Colors.transparent,
                           border: Border(
                             left: BorderSide(
-                                color: kAccent.withValues(alpha: 0.5),
-                                width: 3),
+                                color: Color(0xFFB0B7C3),
+                                width: 1.5),
                           ),
                         ),
-                        tableBorder:
-                            TableBorder.all(color: kBorder, width: 0.5),
+                        tableBorder: TableBorder(
+                        ),
                         tableHead: const TextStyle(
-                            color: kTextPrimary,
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600),
+                            color: Color(0xFF4B5563),
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            height: 1.5),
                         tableBody:
-                            const TextStyle(color: kTextPrimary, fontSize: 13),
-                        tableHeadAlign: TextAlign.center,
+                            const TextStyle(
+                                color: kTextPrimary, fontSize: 15, height: 1.5),
+                        tableHeadAlign: TextAlign.left,
+                        tablePadding:
+                            const EdgeInsets.symmetric(vertical: 30),
                         tableCellsDecoration:
-                            const BoxDecoration(color: kPreviewBg),
+                            const BoxDecoration(color: Color(0xFFFAFBFC)),
                         tableColumnWidth: const FlexColumnWidth(),
                         listBullet: const TextStyle(
-                            color: kAccent, fontSize: 14),
+                            color: kTextPrimary, fontSize: 16),
                         horizontalRuleDecoration: BoxDecoration(
                           border: Border(
                             top: BorderSide(color: kBorder, width: 0.5),
@@ -1318,48 +1446,15 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
                             decoration: TextDecoration.lineThrough),
                         a: const TextStyle(
                             color: kAccent,
-                            decoration: TextDecoration.underline),
+                            decoration: TextDecoration.none),
                         checkbox:
-                            const TextStyle(color: kAccent, fontSize: 14),
+                            const TextStyle(color: Colors.black, fontSize: 16),
                       ),
                     ),
-                  ),
           ),
         ],
       ),
-    );
-  }
-
-  /// 预览区顶部工具条：左端放置导出 PDF / 导出图表 PNG 按钮。
-  Widget _buildPreviewToolbar() {
-    return Container(
-      height: 40,
-      padding: const EdgeInsets.symmetric(horizontal: 12),
-      decoration: const BoxDecoration(
-        color: kPreviewBg,
-        border: Border(bottom: BorderSide(color: kBorder, width: 0.5)),
-      ),
-      child: Row(
-        children: [
-          _IconBtn(
-              icon: Icons.picture_as_pdf_rounded,
-              tooltip: '导出为 PDF',
-              onTap: _exportPdf,
-              loading: _isExporting,
-              color: const Color(0xFFE2574C),
-              hoverColor: const Color(0xFFB71C1C)),
-          const SizedBox(width: 4),
-          _IconBtn(
-              icon: Icons.image_rounded,
-              tooltip: '导出文件中的所有图表为图片',
-              onTap: _exportChartsPng,
-              loading: _isExportingPng,
-              color: const Color(0xFF2E7D32),
-              hoverColor: const Color(0xFF1B5E20)),
-          const Spacer(),
-        ],
-      ),
-    );
+      );
   }
 
   // ── 底部状态栏 ─────────────────────────────────────────────────────────
@@ -1548,10 +1643,106 @@ class _MermaidCodeBlockBuilder extends MarkdownElementBuilder {
     TextStyle? preferredStyle,
     TextStyle? parentStyle,
   ) {
-    if (element.attributes['class'] != 'language-mermaid') return null;
+    md.Element? codeElement;
+    if (element.tag == 'pre' && element.children != null) {
+      for (final child in element.children!) {
+        if (child is md.Element && child.tag == 'code') {
+          codeElement = child;
+          break;
+        }
+      }
+    } else if (element.tag == 'code') {
+      codeElement = element;
+    }
+    final language = codeElement?.attributes['class'];
+    if (language == 'language-mermaid') {
+      final source = element.textContent.replaceFirst(RegExp(r'\n$'), '');
+      return SizedBox(
+        width: double.infinity,
+        child: MermaidView(source: source),
+      );
+    }
+    if (language == null) return null;
     final source = element.textContent.replaceFirst(RegExp(r'\n$'), '');
-    return MermaidView(source: source);
+    if (language == 'language-math' && element.tag == 'code') {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 20),
+        child: SizedBox(
+          width: double.infinity,
+          child: Center(
+            child: Math.tex(
+              source.trim(),
+          mathStyle: MathStyle.display,
+          textStyle: const TextStyle(fontSize: 18, color: Colors.black),
+          onErrorFallback: (error) => Text(
+            source.trim(),
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 16, color: Colors.black),
+          ),
+        ),
+          ),
+        ),
+      );
+    }
+    if (element.tag != 'pre') return null;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: DecoratedBox(
+        decoration: const BoxDecoration(
+          border: Border(
+            top: BorderSide(color: kBorder, width: 0.5),
+            bottom: BorderSide(color: kBorder, width: 0.5),
+          ),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 12),
+          child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              language.replaceFirst('language-', '').toUpperCase(),
+              style: const TextStyle(
+                color: Colors.black54,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.4,
+              ),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              source,
+              style: const TextStyle(
+                color: Colors.black,
+                fontSize: 13,
+                fontFamily: kEditorFontFamily,
+                height: 1.8,
+              ),
+            ),
+          ],
+          ),
+        ),
+      ),
+    );
   }
+
+  @override
+  Widget? visitElementAfter(md.Element element, TextStyle? preferredStyle) {
+    final language = element.attributes['class'];
+    if (language == null || language == 'language-mermaid') return null;
+    final source = element.textContent.replaceFirst(RegExp(r'\n$'), '');
+    return RichText(
+      text: TextSpan(
+        style: const TextStyle(
+          color: Colors.black,
+          fontSize: 13,
+          fontFamily: kEditorFontFamily,
+          height: 1.55,
+        ),
+        children: [TextSpan(text: source)],
+      ),
+    );
+  }
+
 }
 
 // ─── 标题栏按钮 ─────────────────────────────────────────────────────────────
@@ -1559,11 +1750,17 @@ class _MermaidCodeBlockBuilder extends MarkdownElementBuilder {
 class _TitleBarBtn extends StatefulWidget {
   final IconData icon;
   final VoidCallback onTap;
+  final Color? hoverColor;
+  final double buttonSize;
+  final double iconSize;
   final bool danger; // 关闭按钮 hover 红色
   const _TitleBarBtn({
     required this.icon,
     required this.onTap,
+    this.hoverColor,
     this.danger = false,
+    this.buttonSize = 28,
+    this.iconSize = 16,
   });
 
   @override
@@ -1575,7 +1772,9 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
 
   @override
   Widget build(BuildContext context) {
-    final hoverBg = widget.danger ? Colors.red : kAccent;
+    final hoverBg = widget.danger
+        ? Colors.red
+        : (widget.hoverColor ?? kAccent);
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
       onExit: (_) => setState(() => _hovered = false),
@@ -1584,17 +1783,70 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
         onTap: widget.onTap,
         child: AnimatedContainer(
           duration: const Duration(milliseconds: 120),
-          width: 28,
-          height: 28,
+          width: widget.buttonSize,
+          height: widget.buttonSize,
           decoration: BoxDecoration(
             color: _hovered ? hoverBg : Colors.transparent,
             borderRadius: BorderRadius.circular(6),
           ),
           child: Icon(widget.icon,
-              size: 16,
+              size: widget.iconSize,
               color: _hovered
                   ? Colors.white
                   : (widget.danger ? Colors.black54 : kTextSecondary)),
+        ),
+      ),
+    );
+  }
+}
+
+class _ExportModeTile extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final VoidCallback onTap;
+
+  const _ExportModeTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: const Color(0xFFF4F6F8),
+      borderRadius: BorderRadius.circular(10),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
+          child: Row(
+            children: [
+              Icon(icon, size: 21, color: kTextSecondary),
+              const SizedBox(width: 11),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: const TextStyle(
+                            fontSize: 13.5,
+                            fontWeight: FontWeight.w600,
+                            color: kTextPrimary)),
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: const TextStyle(
+                            fontSize: 11.5, color: kTextSecondary)),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right_rounded,
+                  size: 18, color: kTextSecondary),
+            ],
+          ),
         ),
       ),
     );
@@ -1605,6 +1857,7 @@ class _TitleBarBtnState extends State<_TitleBarBtn> {
 
 class _IconBtn extends StatefulWidget {
   final IconData icon;
+  final Widget? iconWidget;
   final String tooltip;
   final VoidCallback? onTap;
   final bool enabled;
@@ -1614,6 +1867,7 @@ class _IconBtn extends StatefulWidget {
 
   const _IconBtn({
     required this.icon,
+    this.iconWidget,
     required this.tooltip,
     this.onTap,
     this.enabled = true,
@@ -1671,7 +1925,7 @@ class _IconBtnState extends State<_IconBtn> {
                         color: widget.color ?? kAccent,
                       ),
                     )
-                  : Icon(widget.icon, size: 17, color: color),
+              : widget.iconWidget ?? Icon(widget.icon, size: 17, color: color),
             ),
           ),
         ),
@@ -1769,7 +2023,7 @@ class _WorkspaceListItemState extends State<_WorkspaceListItem> {
   @override
   Widget build(BuildContext context) {
     final bg = widget.active
-        ? kAccent.withValues(alpha: 0.12)
+        ? Colors.black.withValues(alpha: 0.08)
         : (_hovered ? Colors.black.withValues(alpha: 0.04) : Colors.transparent);
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
@@ -1783,16 +2037,14 @@ class _WorkspaceListItemState extends State<_WorkspaceListItem> {
             color: bg,
             border: Border(
               left: BorderSide(
-                  color: widget.active ? kAccent : Colors.transparent, width: 3),
+                  color: widget.active ? kTextSecondary : Colors.transparent, width: 3),
             ),
           ),
           child: Row(
             children: [
               widget.active
-                  ? const BrandIcon(
-                      icon: Icons.description_rounded,
-                      size: 20,
-                      iconSize: 12)
+                  ? const Icon(Icons.description_rounded,
+                      size: 16, color: kTextSecondary)
                   : Icon(Icons.insert_drive_file_outlined,
                       size: 14, color: kTextSecondary),
               const SizedBox(width: 8),
@@ -1805,7 +2057,7 @@ class _WorkspaceListItemState extends State<_WorkspaceListItem> {
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontSize: 12.5,
-                      color: widget.active ? kAccent : kTextPrimary,
+                      color: kTextPrimary,
                       fontWeight:
                           widget.active ? FontWeight.w600 : FontWeight.w400,
                     ),
@@ -1827,8 +2079,12 @@ class _MiniBtn extends StatefulWidget {
   final IconData icon;
   final String tooltip;
   final VoidCallback onTap;
+  final bool large;
   const _MiniBtn(
-      {required this.icon, required this.tooltip, required this.onTap});
+      {required this.icon,
+      required this.tooltip,
+      required this.onTap,
+      this.large = false});
 
   @override
   State<_MiniBtn> createState() => _MiniBtnState();
@@ -1848,8 +2104,8 @@ class _MiniBtnState extends State<_MiniBtn> {
         child: GestureDetector(
           onTap: widget.onTap,
           child: Container(
-            width: 24,
-            height: 24,
+            width: widget.large ? 30 : 24,
+            height: widget.large ? 30 : 24,
             decoration: BoxDecoration(
               color: _hovered
                   ? kAccent.withValues(alpha: 0.12)
@@ -1857,7 +2113,7 @@ class _MiniBtnState extends State<_MiniBtn> {
               borderRadius: BorderRadius.circular(5),
             ),
             child: Icon(widget.icon,
-                size: 14,
+                size: widget.large ? 18 : 14,
                 color: _hovered ? kAccent : kTextSecondary),
           ),
         ),

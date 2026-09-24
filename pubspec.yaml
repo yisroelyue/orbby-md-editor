@@ -43,6 +43,8 @@ dependencies:
   flutter_svg: ^2.3.0
   re_editor: ^0.10.0
   re_highlight: ^0.0.3
+  flutter_math_fork: ^0.7.4
+  url_launcher: ^6.3.2
 
 dev_dependencies:
   flutter_test:
@@ -68,7 +70,9 @@ flutter:
 
   assets:
     - assets/mermaid/
+    - assets/无内容.svg
     - assets/markdown.svg
+    - assets/导出.svg
 
   # To add assets to your application, add an assets section, like this:
   # assets:

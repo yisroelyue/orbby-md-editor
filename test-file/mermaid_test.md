@@ -8,12 +8,24 @@
 
 ```mermaid
 flowchart TD
+    classDef start fill:#FFF1B8,stroke:#F5B800,stroke-width:1.5px
+    classDef process fill:#DDE9FF,stroke:#5287FF,stroke-width:1.5px
+    classDef decision fill:#FFD9F0,stroke:#E83DB8,stroke-width:1.5px
+    classDef document fill:#FFE0DC,stroke:#FF806D,stroke-width:1.5px
+    class A,G start
+    class B decision
+    class C,E,F process
+    class D document
     A[开始] --> B{是否已登录?}
     B -- 是 --> C[进入主页]
     B -- 否 --> D[跳转登录页]
     C --> E[请求数据]
     E --> F[渲染图表]
     F --> G[结束]
+    class A,G start
+    class B decision
+    class C,E,F process
+    class D document
 ```
 
 ## 2. 流程图（flowchart LR，带子图）

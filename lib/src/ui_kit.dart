@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 
+import 'editor_theme.dart';
+
 // ─── 品牌视觉 ───────────────────────────────────────────────────────────────
 
 /// 品牌主渐变：蓝 → 靛紫（与应用主色 kAccent 呼应）。
@@ -54,12 +56,14 @@ class GradientButton extends StatefulWidget {
   final IconData? icon;
   final VoidCallback onPressed;
   final bool expanded; // 占满父级宽度
+  final bool muted;
   const GradientButton({
     super.key,
     required this.label,
     this.icon,
     required this.onPressed,
     this.expanded = false,
+    this.muted = false,
   });
 
   @override
@@ -76,9 +80,10 @@ class _GradientButtonState extends State<GradientButton> {
       borderRadius: BorderRadius.circular(10),
       child: Ink(
         decoration: BoxDecoration(
-          gradient: kBrandGradient,
+          color: widget.muted ? const Color(0xFFF0F2F5) : null,
+          gradient: widget.muted ? null : kBrandGradient,
           borderRadius: BorderRadius.circular(10),
-          boxShadow: _hovered
+          boxShadow: _hovered && !widget.muted
               ? const [
                   BoxShadow(
                       color: Color(0x40448AFF),
@@ -101,12 +106,14 @@ class _GradientButtonState extends State<GradientButton> {
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 if (widget.icon != null) ...[
-                  Icon(widget.icon, size: 16, color: Colors.white),
+                  Icon(widget.icon,
+                      size: 16,
+                      color: widget.muted ? kTextSecondary : Colors.white),
                   const SizedBox(width: 6),
                 ],
                 Text(widget.label,
-                    style: const TextStyle(
-                        color: Colors.white,
+                    style: TextStyle(
+                        color: widget.muted ? kTextPrimary : Colors.white,
                         fontSize: 13,
                         fontWeight: FontWeight.w600)),
               ],

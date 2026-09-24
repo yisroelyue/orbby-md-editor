@@ -149,8 +149,8 @@ class _MermaidViewState extends State<MermaidView>
   void _renderCurrent() {
     if (!_webviewInitialized) return;
     final b64 = base64Encode(utf8.encode(widget.source));
-    // 未手动调整过就传 -1，让 JS 端按图内容自动算默认缩放
-    final target = _userAdjusted ? _zoom : -1.0;
+    // 未手动调整时使用 80% 默认缩放；已有手动缩放值保持不变。
+    final target = _userAdjusted ? _zoom : 0.8;
     try {
       _controller.executeScript(
           "window.__targetScale = $target; window.__renderMermaid('$b64');");
@@ -241,6 +241,7 @@ class _MermaidViewState extends State<MermaidView>
       return const SizedBox(height: 300);
     }
     return SizedBox(
+      width: double.infinity,
       height: _contentHeight,
       child: Stack(
         children: [
@@ -248,16 +249,6 @@ class _MermaidViewState extends State<MermaidView>
             child: ClipRRect(
               borderRadius: BorderRadius.circular(6),
               child: Webview(_controller),
-            ),
-          ),
-          Positioned(
-            top: 6,
-            right: 6,
-            child: _ZoomBar(
-              zoom: _zoom,
-              onZoomIn: () => _changeZoom(0.2),
-              onZoomOut: () => _changeZoom(-0.2),
-              onReset: _resetZoom,
             ),
           ),
         ],
@@ -335,9 +326,73 @@ const _htmlTemplate = r'''<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <style>
-  html, body { margin:0; padding:0; background:#ffffff; overflow:hidden; }
+  html, body {
+    margin:0;
+    padding:0;
+    background-color:#ffffff;
+    overflow:hidden;
+    user-select:text;
+    -webkit-user-select:text;
+  }
   #diagram { display:flex; justify-content:center; padding:12px; box-sizing:border-box; }
-  #diagram svg { max-width:100%; height:auto; display:block; }
+  #diagram svg {
+    max-width:100%;
+    height:auto;
+    display:block;
+    user-select:text;
+    -webkit-user-select:text;
+  }
+  #diagram text,
+  #diagram foreignObject,
+  #diagram foreignObject * {
+    user-select:text;
+    -webkit-user-select:text;
+  }
+  /* 流程图统一为浅色画布、彩色节点和直角连线。 */
+  #diagram svg[aria-roledescription="flowchart"] .node rect,
+  #diagram svg[aria-roledescription="flowchart"] .node polygon,
+  #diagram svg[aria-roledescription="flowchart"] .node circle {
+    stroke-width:1.5px;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .node.start rect,
+  #diagram svg[aria-roledescription="flowchart"] .node.start polygon {
+    fill:#FFF1B8 !important;
+    stroke:#F5B800 !important;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .node.process rect,
+  #diagram svg[aria-roledescription="flowchart"] .node.process polygon {
+    fill:#DDE9FF !important;
+    stroke:#5287FF !important;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .node.decision rect,
+  #diagram svg[aria-roledescription="flowchart"] .node.decision polygon {
+    fill:#FFD9F0 !important;
+    stroke:#E83DB8 !important;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .node.document rect,
+  #diagram svg[aria-roledescription="flowchart"] .node.document polygon,
+  #diagram svg[aria-roledescription="flowchart"] .node.document path {
+    fill:#FFE0DC !important;
+    stroke:#FF806D !important;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .edgePath .path {
+    stroke:#222222;
+    stroke-width:1.2px;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .arrowheadPath {
+    fill:#222222;
+    stroke:#222222;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .edgeLabel rect {
+    fill:#ffffff;
+    opacity:.96;
+  }
+  #diagram svg[aria-roledescription="flowchart"] .edgeLabel text,
+  #diagram svg[aria-roledescription="flowchart"] .nodeLabel {
+    fill:#222222;
+    color:#222222;
+    font-family:'Microsoft YaHei', sans-serif;
+  }
   .err { color:#ff6b6b; font-family:Consolas,monospace; font-size:13px; white-space:pre-wrap; word-break:break-all; }
 </style>
 </head>
@@ -356,7 +411,31 @@ const _htmlTemplate = r'''<!DOCTYPE html>
     startOnLoad: false,
     theme: 'default',
     securityLevel: 'loose',
-    fontFamily: 'Microsoft YaHei'
+    fontFamily: 'Microsoft YaHei',
+    themeVariables: {
+      background: '#ffffff',
+      primaryColor: '#DDE9FF',
+      primaryTextColor: '#222222',
+      primaryBorderColor: '#5287FF',
+      secondaryColor: '#FFF1B8',
+      secondaryTextColor: '#222222',
+      secondaryBorderColor: '#F5B800',
+      tertiaryColor: '#FFD9F0',
+      tertiaryTextColor: '#222222',
+      tertiaryBorderColor: '#E83DB8',
+      lineColor: '#222222',
+      textColor: '#222222',
+      nodeBorder: '#5287FF',
+      clusterBkg: '#F8FAFF',
+      clusterBorder: '#B8C8F5',
+      edgeLabelBackground: '#ffffff'
+    },
+    flowchart: {
+      curve: 'linear',
+      nodeSpacing: 50,
+      rankSpacing: 60,
+      htmlLabels: true
+    }
   });
 
   // 图适应容器宽度后的实际显示宽度 / viewBox 自然宽度 / 按内容自动适配的比例

@@ -499,7 +499,7 @@ window.addEventListener('load', function () {
   code { font-family: 'Cascadia Code', 'Consolas', monospace; background: #F0F2F5; color: #C7254E; padding: 1px 4px; border-radius: 3px; }
   pre { background: #F5F5F5; border: 1px solid #E0E0E0; border-radius: 8px; padding: 12px; overflow: auto; }
   pre code { background: none; color: #24292E; padding: 0; }
-  blockquote { border-left: 3px solid #448AFF; background: #F0F5FF; margin: 8px 0; padding: 4px 12px; color: #6A737D; }
+  blockquote { border-left: 1.5px solid #448AFF; background: #F0F5FF; margin: 8px 0; padding: 2px 8px 2px 14px; color: #6A737D; }
   table { border-collapse: collapse; width: 100%; }
   th, td { border: 1px solid #E0E0E0; padding: 6px 10px; text-align: left; }
   th { background: #FAFAFA; font-weight: 600; text-align: center; }
