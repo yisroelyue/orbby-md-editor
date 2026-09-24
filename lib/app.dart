@@ -3,7 +3,9 @@ import 'package:flutter/material.dart';
 import 'src/markdown_viewer_screen.dart';
 
 class MarkdownViewerApp extends StatelessWidget {
-  const MarkdownViewerApp({super.key});
+  const MarkdownViewerApp({super.key, this.initialFilePath});
+
+  final String? initialFilePath;
 
   @override
   Widget build(BuildContext context) {
@@ -27,7 +29,7 @@ class MarkdownViewerApp extends StatelessWidget {
           ),
           child: ClipRRect(
             borderRadius: BorderRadius.circular(8),
-            child: const MarkdownViewerScreen(),
+            child: MarkdownViewerScreen(initialFilePath: initialFilePath),
           ),
         ),
       ),

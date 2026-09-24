@@ -22,7 +22,9 @@ import 'workspace_store.dart';
 // ─── 主内容组件 ─────────────────────────────────────────────────────────────
 
 class MarkdownViewerScreen extends StatefulWidget {
-  const MarkdownViewerScreen({super.key});
+  const MarkdownViewerScreen({super.key, this.initialFilePath});
+
+  final String? initialFilePath;
 
   @override
   State<MarkdownViewerScreen> createState() => MarkdownViewerScreenState();
@@ -72,6 +74,28 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
     // 直接监听全局键盘，确保 Ctrl+S 在编辑器聚焦时也能触发保存
     HardwareKeyboard.instance.addHandler(_onHardwareKey);
     _loadWorkspace();
+    final initialFilePath = widget.initialFilePath;
+    if (initialFilePath != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _loadInitialFile(initialFilePath);
+      });
+    }
+  }
+
+  Future<void> _loadInitialFile(String path) async {
+    final file = File(path);
+    if (!await file.exists()) {
+      if (mounted) _showSnackBar('文件不存在: $path', error: true);
+      return;
+    }
+    final ok = await _loadFile(path);
+    if (ok && mounted) {
+      _showSnackBar('已打开 ${file.uri.pathSegments.last}');
+      if (!_store.isInsideFilesDir(path)) {
+        await _store.addHistory(path);
+        await _refreshWorkspace();
+      }
+    }
   }
 
   /// 启动时加载左侧工作区：确保目录存在，列出项目文件与历史记录。
@@ -656,7 +680,27 @@ class MarkdownViewerScreenState extends State<MarkdownViewerScreen> {
       await windowManager.setBounds(_restoreBounds);
     } else {
       _restoreBounds = await windowManager.getBounds();
-      final display = await screenRetriever.getPrimaryDisplay();
+      // 无边框窗口不能调用系统最大化，因此根据窗口当前中心点选择屏幕。
+      // 这里不能固定使用 primary display，否则从副屏点击最大化时会跳回主屏。
+      final bounds = _restoreBounds;
+      final center = Offset(
+        bounds.left + bounds.width / 2,
+        bounds.top + bounds.height / 2,
+      );
+      final displays = await screenRetriever.getAllDisplays();
+      final display = displays.firstWhere(
+        (item) {
+          final position = item.visiblePosition ?? Offset.zero;
+          final size = item.visibleSize ?? item.size;
+          return center.dx >= position.dx &&
+              center.dx < position.dx + size.width &&
+              center.dy >= position.dy &&
+              center.dy < position.dy + size.height;
+        },
+        orElse: () => displays.isNotEmpty
+            ? displays.first
+            : throw StateError('No display found'),
+      );
       final pos = display.visiblePosition ?? Offset.zero;
       final size = display.visibleSize ?? display.size;
       // 铺满工作区（已排除任务栏），无边框窗口避免盖住状态栏

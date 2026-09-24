@@ -13,14 +13,26 @@ const kHeightFactor = 0.9;
 const kMinWidth = 640.0;
 const kMinHeight = 400.0;
 
-Future<void> main() async {
+Future<void> main([List<String> args = const <String>[]]) async {
   WidgetsFlutterBinding.ensureInitialized();
 
   await LogService.init();
   await windowManager.ensureInitialized();
 
   await _configureWindow();
-  runApp(const MarkdownViewerApp());
+  // Windows 文件关联会把被双击的文件路径作为启动参数传入。
+  String? initialFilePath;
+  for (final arg in args) {
+    final lower = arg.toLowerCase();
+    if (arg.trim().isNotEmpty &&
+        (lower.endsWith('.md') ||
+            lower.endsWith('.markdown') ||
+            lower.endsWith('.txt'))) {
+      initialFilePath = arg;
+      break;
+    }
+  }
+  runApp(MarkdownViewerApp(initialFilePath: initialFilePath));
 }
 
 /// 无边框窗口：宽 1400，高 = 屏幕可见高 × 80%（clamp 到最小 400），居中显示。
